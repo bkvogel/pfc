@@ -6,12 +6,12 @@ This is the official implementation of the arxiv paper "[An NMF-Based Building B
 ### Setup
 
 Requirements:
-- Nvidia GPU (test on RTX 4090, but anything recent with at least 8GB might be sufficient)
-- Compatible Linux distribution (tested on Ubuntu 22.04, and Kubuntu 23.10)
+- Nvidia GPU (tested on RTX 4090, but anything recent with at least 8GB might be sufficient)
+- Compatible Linux distribution (tested on Ubuntu 22.04 and Kubuntu 23.10)
 
-Create a folder where the downloaded MNIST, Fashion MNIST, and CIFAR10 datasets will be stored. Set `datasets_root` in `run_factor_network_experiments.py` to the location of this folder.
+Create a folder where the downloaded MNIST, Fashion MNIST, and CIFAR10 datasets will be stored. Set `datasets_root` in `run_experiments.py` to the location of this folder.
 
-If using Anaconda and Ubuntu 22.04, create a new conda environment and install the dependencies:
+If using Anaconda, create a new conda environment and install the dependencies:
 
 ```
 conda create --name pytorch_3_11 python=3.11
@@ -42,17 +42,17 @@ Main scripts:
 
 Folders:
 - `models/`: Contains the models used (PFC blocks, MLP, vanilla and factorized RNNs, etc.)
-- `utils/`: Contains various utility functions, including the NMF (including both SGD and Lee-Seung), FISTA, normalization, etc.
-- `figures/`: Some experiments will output png files to sub-folders in this directory, corresponding to the paper figures.
-- `debug_plots/`: Some experiments will output debugging plots (as png files) here.
-    - Any existing png files in this folder are automatically deleted by `run_experiments.py` just before starting the experiment.
-    - These png plots typically refresh occasionally while the script is running. They are produced in the `print_state()` method of the various model classes.
+- `utils/`: Contains various utility functions, including the NMF (SGD and Lee-Seung update rules), FISTA, normalization, etc.
+- `figures/`: Some experiments will output `png` files to the sub-folders in this directory, corresponding to the paper figures.
+- `debug_plots/`: Some experiments will output debugging plots (as `png` files) here.
+    - Any existing `png` files in this folder are automatically deleted by `run_experiments.py` just before starting the experiment.
+    - These `png` plots typically refresh occasionally while the script is running. They are produced in the `print_stats()` method of the various model classes.
 - `openunmix/`: Dataset loaders for the source separation experiment.
 - `saved_models/`: Contains saved Pytorch model files generated while running the experiments.
 
 Output logs:
 - `experiment_results.log`: Contains concise experiment results produces by the scripts.
-- `debug.log`: Extremely verbose logs.
+- `debug.log`: More verbose logs.
 
 ### Running the main experiments in `run_experiments.py`
 
@@ -75,9 +75,9 @@ tail -f debug.log
     - You can go into the function `train_and_evaluate_various_classifier()` and enable/disable individual experiments. E.g., set `run_mlp_image_classification_experiment = False` etc.
 * Factorized RNN using standard NMF updates on a deterministic sequence memorization task: `run_experiment = 'train_and_evaluate_learning_repeated_sequence'`
 * Factorized RNN using standard NMF learning and inference updates on the Copy Task: `run_experiment = 'train_and_evaluate_copy_task_factorized_rnn'`
-* Conventional RNN trained with and without BPTT on the copy task: `run_experiment = 'train_and_evaluate_copy_task_vanilla_rnn'`
-* Factorized and conventional RNNs on the Sequential MNIST task (uses backprop, with or without BPTT): `run_experiment = 'run_sequential_mnist_rnn_experiments'`
-* Factorized RNNs on the Sequential MNIST task using conventional NMF learning and inference updates (no backprop): `run_experiment = 'sequential_mnist_factorized_rnn_conventional_nmf'`
+* Conventional vanilla RNN trained with and without BPTT on the copy task: `run_experiment = 'train_and_evaluate_copy_task_vanilla_rnn'`
+* Factorized and conventional vanilla RNNs on the Sequential MNIST task (uses backprop, with or without BPTT): `run_experiment = 'run_sequential_mnist_rnn_experiments'`
+* Factorized RNNs on the Sequential MNIST task using only NMF learning and inference updates (no backprop): `run_experiment = 'sequential_mnist_factorized_rnn_conventional_nmf'`
 
 
 ### Source separation on  MUSDB18
