@@ -417,10 +417,10 @@ class RNNSequentialClassificationEvaluator:
         loss_x = 0
         loss_y = 0
         for m in range(seq_len):
-            x = x[:, :, m]  
+            x_slice = x[:, :, m]  
             # y_t shape = (batch_size, y_dim)
             # h shape = (batch_size, h_dim)
-            y_t, h = model(x, self.h_prev)
+            y_t, h = model(x_slice, self.h_prev)
 
             # logging
             with torch.no_grad():
@@ -437,7 +437,7 @@ class RNNSequentialClassificationEvaluator:
                     loss_h = loss_h + torch.nn.functional.mse_loss(h_prev_pred, h_prev_targets, reduction='sum')/torch.numel(h_prev_targets)
 
                     x_pred = torch.einsum("ij,kj->ki", model.W_x, h)
-                    x_targets = x.clone().detach()
+                    x_targets = x_slice.clone().detach()
                     loss_x = loss_x + torch.nn.functional.mse_loss(x_pred, x_targets, reduction='sum')/torch.numel(x_targets)
 
             if m == seq_len - 1:
@@ -3061,7 +3061,7 @@ if __name__ == "__main__":
     torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
 
     # choose experiment to run:
-    run_experiment = 'train_and_evaluate_various_classifier'
+    run_experiment = 'run_sequential_mnist_rnn_experiments'
 
     if run_experiment == 'train_and_evaluate_various_classifier':
         # Run classifier experiments on MLP-like models. (Use for paper)
