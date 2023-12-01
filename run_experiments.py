@@ -154,12 +154,196 @@ class RNNCopyTaskEvaluator:
         self.vocab_size = vocab_size
         self.copy_seq_len = copy_seq_len
         self.h_dim = self.model.hidden_dim
-        self.has_cell = model.has_cell
         # previous hidden state
         self.h_prev = None
-        if self.has_cell:
-            # previous cell state (if LSTM)
-            self.c_prev = None
+        self.device = device
+
+    @torch.no_grad()
+    def print_stats(self, logger, do_plots=True, description=""):
+        """Print debug info.
+
+        """
+        logger.debug(f"Model info for: {description}")
+        self.model.print_stats(do_plots=do_plots, description=description)
+        # self.h_tran has shape = (batch_size, seq_len, h_dim)
+        # Since it is 3D, just pick one example to use for visualization:
+        example_index = 0
+        # h_prev shape = (h_dim, seq_len)
+        h_prev = self.h_prev_all_slices[example_index, :, :]
+        # h shape = (h_dim, seq_len)
+        h = self.h_all_slices[example_index, :, :]
+        # x shape = (x_dim, seq_len)
+        x = self.x_targets_all_slices[example_index, :, :]
+        logger.debug("H: min value: {}; max value: {}".format(h.min(), h.max()))
+        h_sparsity = hoyer_sparsity(h, dim=1)
+        mean_sparsity = torch.mean(h_sparsity).item()
+        logger.debug(f"H: sparsity: {mean_sparsity}")
+        
+        if do_plots:
+            config = self.model.config
+            plot_image_matrix(h, file_name=f"{config.results_dir}/{description}_H.png", 
+                                title=f"{description}: H")
+            if config.rnn_type == "FactorizedRNN":
+                W_h = self.model.W_h
+                W_y = self.model.W_y
+                W_x = self.model.W_x
+            elif config.rnn_type == "ModifiedFactorizedRNN":
+                W_h = self.model.W_h
+                W_y = self.model.W_y
+                W_x = self.model.W_x
+            elif config.rnn_type == "vanillaRNN":
+                W_h = self.model.h_prev_to_h.weight.data
+                W_y = self.model.h_to_y.weight.data
+                W_x = self.model.x_to_hidden_dim.weight.data.t()
+            else:
+                logger.debug("Current RNN not supported for plots")
+                return
+            W = torch.cat((W_y, W_h, W_x), dim=0)
+            V_pred = W @ h
+            plot_image_matrix(V_pred, file_name=f"{config.results_dir}/{description}_V_pred.png", 
+                                title=f"{description}: V_pred")
+            
+            y_pred = self.y_pred_all_slices[example_index, :, :]
+            (num_classes, seq_len) = y_pred.size()
+            plot_image_matrix(y_pred, f"{config.results_dir}/{description}_y_pred.png", 
+                title=f"{description}: Predicted values for training targets")
+            
+            h_prev_pred = W_h @ h
+            plot_image_matrix(h_prev_pred, f"{config.results_dir}/{description}_h_prev_pred.png", 
+                title=f"{description}: Predicted values for H_prev hidden states")
+            
+            x_pred = W_x @ h
+            plot_image_matrix(x_pred, f"{config.results_dir}/{description}_x_pred.png", 
+                title=f"{description}: Predicted values for X inputs")
+            
+            # Now plot the target values:
+            # Plot the Y (class label) targets:
+            y_targets = self.y_targets_last_slice[example_index]
+            plot_image_matrix(y_targets, f"{config.results_dir}/{description}_y_targets_1_example.png", 
+                title=f"{description}: y_targets")
+            
+            plot_image_matrix(h_prev, f"{config.results_dir}/{description}_H_prev_targets_1_example.png", 
+                title=f"{description}: H_prev (previous hidden states) targets")
+
+            plot_image_matrix(x, f"{config.results_dir}/{description}_X_targets_1_example.png", 
+                title=f"{description}: X (input features) targets")
+
+
+    def forward(
+        self,
+        x,
+        y_targets,
+        is_reset,
+        enable_backprop_through_time,
+        loss_type="mse",
+    ):
+        """Evaluate the on a batch of inputs.
+
+        Args:
+            x (Tensor of float): Input features of shape (batch_size, feature_dim, seq_len).
+            y_targets (Tensor of float or int): Target (ground truth) features of shape (batch_size, feature_dim, seq_len).
+            is_reset (Tensor of boolean). Shape is (batch_size,) and is True if the i'th example
+                in the batch is the start of a new sequence, in which case the internal state
+                for this example needs to be reset.
+        """
+        (batch_size, feature_dim, seq_len) = x.size()        
+        h_zero = torch.zeros(batch_size, self.h_dim, device=x.device)
+        if self.h_prev is None:
+            self.h_prev = h_zero
+        elif self.h_prev.size() != h_zero.size():
+            print("h_prev size has changed. Resetting...")
+            self.h_prev = h_zero
+
+        # todo: reset state is not used in the Copy Task.
+        # Reset the internal state of any examples in the batch where is_reset is True.
+        is_reset_h = torch.unsqueeze(is_reset, 1)
+        is_reset_h = is_reset_h.expand(batch_size, self.h_prev.size(1))
+        self.h_prev = torch.where(is_reset_h, h_zero, self.h_prev)
+
+        # Create empty tensors for logging/visualization only:
+        device = x.device
+        self.y_pred_all_slices = torch.zeros((batch_size, self.model.out_dim, seq_len), device=device)
+        self.x_all_slices = torch.zeros((batch_size, feature_dim, seq_len), device=device)
+        self.h_prev_all_slices = torch.zeros((batch_size, self.h_dim, seq_len), device=device)
+        self.h_all_slices = torch.zeros((batch_size, self.h_dim, seq_len), device=device)
+
+        with torch.no_grad():
+            self.y_targets_last_slice = y_targets.clone().detach()
+            self.x_targets_all_slices = x.clone().detach()
+
+        model = self.model
+        start_slice = seq_len - self.copy_seq_len
+        computed_loss_count = 0
+        loss = 0
+        batch_correct = 0
+        for m in range(seq_len):
+            x_slice = x[:, :, m]
+            if loss_type == "mse_factorized":
+                y_t, h, loss_x_slice, loss_h_slice = model(x_slice, self.h_prev, return_reconstruction_loss = True)
+            else:
+                y_t, h = model(x_slice, self.h_prev)
+
+            # logging
+            with torch.no_grad():
+                self.y_pred_all_slices[:, :, m] = y_t[:, :]
+                self.h_prev_all_slices[:, :, m] = self.h_prev[:, :]
+                self.h_all_slices[:, :, m] = h[:, :]
+
+            cur_targets = y_targets[:, :, m]
+            # Only compute the loss on the last copy_seq_len slices.
+            
+            if m >= start_slice:
+                cur_targets_int = torch.argmax(cur_targets, dim=1)
+                if loss_type == "cross_entropy":
+                    loss = loss + F.cross_entropy(y_t, cur_targets_int)
+                elif loss_type == "mse":
+                    loss = loss + F.mse_loss(y_t, cur_targets, reduction="sum")
+                elif loss_type == "mse_factorized":
+                    loss_pred_y = F.mse_loss(y_t, cur_targets, reduction="sum")/torch.numel(cur_targets)
+                    loss = loss + loss_pred_y + loss_x_slice + loss_h_slice
+                else:
+                    raise ValueError("Bad loss type")
+                computed_loss_count += 1
+                # compute accuracy:
+                pred_int = torch.argmax(y_t, dim=1)
+                batch_correct += pred_int.eq(cur_targets_int.view_as(pred_int)).sum().item()
+                
+            if enable_backprop_through_time:
+                self.h_prev = h
+            else:
+                self.h_prev = h.clone().detach()
+
+        # Must detach before returning because we can't let gradients flow between batches.
+        self.h_prev = h.clone().detach()
+
+        assert computed_loss_count == self.copy_seq_len
+        # Note: Just like a regular RNN, we only do 1 optimizer update per batch.
+        if loss_type == "mse":
+            loss = loss / (feature_dim * computed_loss_count * batch_size)
+        elif loss_type == "cross_entropy":
+            loss = loss / self.copy_seq_len
+        elif loss_type == "mse_factorized":
+            loss = loss / computed_loss_count
+        else:
+            raise ValueError("bad value")
+
+        acc_denom = batch_size*self.copy_seq_len
+        return loss, batch_correct, acc_denom
+
+
+
+
+
+class to_delete_RNNCopyTaskEvaluator:
+    """Evaluate the forward pass of an RNN on the copy task."""
+
+    def __init__(self, model, vocab_size, copy_seq_len, device) -> None:
+        self.model = model
+        self.vocab_size = vocab_size
+        self.copy_seq_len = copy_seq_len
+        self.h_dim = self.model.hidden_dim
+        # previous hidden state
+        self.h_prev = None
         self.device = device
 
     def forward(
@@ -180,15 +364,6 @@ class RNNCopyTaskEvaluator:
                 for this example needs to be reset.
         """
         (batch_size, feature_dim, seq_len) = x_train.size()
-
-        if self.has_cell:
-            c_zero = torch.zeros(batch_size, self.h_dim, device=x_train.device)
-            if self.c_prev is None:
-                self.c_prev = c_zero
-            elif self.c_prev.size() != c_zero.size():
-                print("c_prev size has changed. Resetting...")
-                self.c_prev = c_zero
-        
         h_zero = torch.zeros(batch_size, self.h_dim, device=x_train.device)
         if self.h_prev is None:
             self.h_prev = h_zero
@@ -201,20 +376,13 @@ class RNNCopyTaskEvaluator:
         is_reset_h = torch.unsqueeze(is_reset, 1)
         is_reset_h = is_reset_h.expand(batch_size, self.h_prev.size(1))
         self.h_prev = torch.where(is_reset_h, h_zero, self.h_prev)
-        if self.has_cell:
-            is_reset_c = torch.unsqueeze(is_reset, 1)
-            is_reset_c = is_reset_h.expand(batch_size, self.c_prev.size(1))
-            self.c_prev = torch.where(is_reset_c, c_zero, self.c_prev)
 
         model = self.model
         start_slice = seq_len - self.copy_seq_len
         computed_loss_count = 0
         for m in range(seq_len):
             x = x_train[:, :, m]
-            if self.has_cell:
-                y_t, c, h = model(x, self.c_prev, self.h_prev)
-            else:
-                y_t, h = model(x, self.h_prev)
+            y_t, h = model(x, self.h_prev)
             cur_targets = y_targets[:, :, m]
             # Only compute the loss on the last copy_seq_len slices.
             if m == start_slice:
@@ -245,19 +413,12 @@ class RNNCopyTaskEvaluator:
                 pred_int = torch.argmax(y_t, dim=1)
                 batch_correct += pred_int.eq(cur_targets_int.view_as(pred_int)).sum().item()
                 
-            if self.has_cell:
-                if enable_backprop_through_time:
-                    self.c_prev = c
-                else:
-                    self.c_prev = c.clone().detach()
             if enable_backprop_through_time:
                 self.h_prev = h
             else:
                 self.h_prev = h.clone().detach()
 
         # Must detach before returning because we can't let gradients flow between batches.
-        if self.has_cell:
-            self.c_prev = c.clone().detach()
         self.h_prev = h.clone().detach()
 
         assert computed_loss_count == self.copy_seq_len
@@ -420,7 +581,10 @@ class RNNSequentialClassificationEvaluator:
             x_slice = x[:, :, m]  
             # y_t shape = (batch_size, y_dim)
             # h shape = (batch_size, h_dim)
-            y_t, h = model(x_slice, self.h_prev)
+            if loss_type == "mse_factorized":
+                y_t, h, loss_x_slice, loss_h_slice = model(x_slice, self.h_prev, return_reconstruction_loss = True)
+            else:
+                y_t, h = model(x_slice, self.h_prev)
 
             # logging
             with torch.no_grad():
@@ -432,13 +596,8 @@ class RNNSequentialClassificationEvaluator:
             if m <= seq_len - 1:
                 # Potentially compute the reconstruction loss over all time slices
                 if loss_type == "mse_factorized":
-                    h_prev_pred = torch.einsum("ij,kj->ki", model.W_h, h)
-                    h_prev_targets = self.h_prev.clone().detach()
-                    loss_h = loss_h + torch.nn.functional.mse_loss(h_prev_pred, h_prev_targets, reduction='sum')/torch.numel(h_prev_targets)
-
-                    x_pred = torch.einsum("ij,kj->ki", model.W_x, h)
-                    x_targets = x_slice.clone().detach()
-                    loss_x = loss_x + torch.nn.functional.mse_loss(x_pred, x_targets, reduction='sum')/torch.numel(x_targets)
+                    loss_h = loss_h + loss_h_slice
+                    loss_x = loss_x + loss_x_slice
 
             if m == seq_len - 1:
                 # We need to include the target prediction loss, which is computed only for the last time slice.
@@ -476,25 +635,23 @@ class RNNSequentialClassificationEvaluator:
         return loss, batch_correct, acc_denom
 
 
+def run_copy_task_rnns_with_backprop():
+    """Evaluate vanilla and factorized RNNs on the well-known Copy Task.
 
-def train_and_evaluate_copy_task_vanilla_rnn():
-    """Evaluate vanilla RNNs on the well-known Copy Task.
-
-    This uses conventional vanilla RNNs and supports the following:
-    - BPTT: It can solve the task, e.g with padding length 5.
+    Note for vanilla RNN:
+    - With BPTT: It can solve the task, e.g with padding length 5.
     - Without BPTT: It cannot solve the task for any padding length.
-
-    LayerNorm is used on the hidden states, as we found it to improve performance.
+    - Uses LayerNorm. (helps with accuracy)
 
     """
     config_experiment1 = AttributeDict(
+        results_dir = "debug_plots",
         dataset = "copy task",
         enable_backprop_through_time = True,
         batch_size=512,
         train_iters=10000000,
         validation_iters=200,
         h_dim= 1024,
-        use_optimizer = "rmsprop",
         device="cuda",
         learning_rate=5e-5,
         weight_decay=2e-4,
@@ -509,14 +666,53 @@ def train_and_evaluate_copy_task_vanilla_rnn():
         pad_len = 5,
         vocab_size = 10,
     )
-    config = config_experiment1  
+
+    config_experiment2 = AttributeDict(
+        results_dir = "debug_plots",
+        dataset = "copy task",
+        enable_backprop_through_time = True,
+        batch_size=10,
+        train_iters=10000000,
+        validation_iters=50,
+        h_dim= 512,
+        device="cpu",
+        learning_rate=1e-4,
+        weight_decay=0e-4,
+        loss_type = 'mse',
+        #loss_type = "mse_factorized", 
+        #loss_type="cross_entropy",
+        print_train_loss_every_iterations = 200,
+        compute_validation_loss_every_iterations = 200,
+        rnn_type = "FactorizedRNN",
+        recurrent_drop_prob=0.0,
+        input_drop_prob=0.0,
+        rand_seq_len = 10,
+        pad_len = 5,
+        vocab_size = 10,
+        enforce_nonneg_params = False,
+        weights_noise_scale = 5e-2,
+        sparsity_L1_H = 0,
+        fista_tolerance = None,
+        nmf_inference_iters_no_grad = 0,
+        nmf_gradient_iters_with_grad = 20,
+    )
+
+    config = config_experiment1
+    logger = configure_logger()
+    config.logger = logger
     config.seq_len = 2*config.rand_seq_len + config.pad_len
     
-    rnn = VanillaRNN(config, config.vocab_size + 2, config.h_dim, config.vocab_size,
+    if config.rnn_type == "vanillaRNN":
+        rnn = VanillaRNN(config, config.vocab_size + 2, config.h_dim, config.vocab_size,
                     recurrent_drop_prob=config.recurrent_drop_prob,
                     input_drop_prob=config.input_drop_prob,
                     enable_input_layernorm=False,
                     enable_state_layernorm=True)
+    elif config.rnn_type == "FactorizedRNN":
+        rnn = FactorizedRNN(config, config.vocab_size + 2, config.h_dim, config.vocab_size)
+    else:
+        raise ValueError("bad value")
+
         
     rnn = rnn.to(config.device)
     #rnn = torch.compile(rnn)
@@ -529,7 +725,6 @@ def train_and_evaluate_copy_task_vanilla_rnn():
     rnn.train(True)
     best_validation_loss = None
     best_validation_accuracy = None
-    best_epoch = 0
     train_loss_accumulator = ValueAccumulator()
     for n in range(config.train_iters):
         # x_train and y_targets both have shape = (batch_size, vocab_size, seq_len)
@@ -554,7 +749,7 @@ def train_and_evaluate_copy_task_vanilla_rnn():
         train_loss_accumulator.accumulate(loss.item())
 
         if n % config.print_train_loss_every_iterations == 0:
-            print(f"iteration: {n} | training loss: {train_loss_accumulator.get_mean()}")
+            logger.debug(f"iteration: {n} | training loss: {train_loss_accumulator.get_mean()}")
             train_loss_accumulator.reset()
 
         loss.backward()
@@ -563,7 +758,7 @@ def train_and_evaluate_copy_task_vanilla_rnn():
 
         if n % config.compute_validation_loss_every_iterations == 0:
             rnn.train(False)
-            print("Computing validation loss...")
+            logger.debug("Computing validation loss...")
             val_evaluator = RNNCopyTaskEvaluator(rnn, config.vocab_size, config.rand_seq_len, device=config.device)
             val_acc_accumulator = ValueAccumulator()
             loss_val = 0
@@ -603,19 +798,21 @@ def train_and_evaluate_copy_task_vanilla_rnn():
                 best_validation_accuracy = validation_accuracy
             elif validation_accuracy > best_validation_accuracy:
                 best_validation_accuracy = validation_accuracy
-            print(f"validation loss: {validation_loss} | best loss so far: {best_validation_loss} | accuracy: {validation_accuracy} | best so far: {best_validation_accuracy}")
-            print(f"numer: {val_acc_accumulator.get_total()} | denom: {val_acc_accumulator.get_count()}")
+            logger.debug(f"validation loss: {validation_loss} | best loss so far: {best_validation_loss} | accuracy: {validation_accuracy} | best so far: {best_validation_accuracy}")
+            if True:
+                # debug plots
+                val_evaluator.print_stats(config.logger, do_plots=True, description="validation")
+            if validation_accuracy  >= (1.0 - 1e-5):
+                logger.debug("Solved!")
+                break
 
-    print("Done!")
 
-
-
-def train_and_evaluate_copy_task_factorized_rnn():
+def run_copy_task_factorized_rnn_no_backprop():
     """Evaluate the factorized RNN on the well-known Copy Task.
 
-    This version uses the factorized RNN with conventional NMF updates for both W and H.
+    This version uses the factorized RNN with NMF learning and inference updates
+    (no backpropagation).
 
-    It uses a mini-batched implementation.
     """
     config_experiment1 = AttributeDict(
         results_dir = "debug_plots",
@@ -1399,8 +1596,8 @@ def sequential_mnist_task_various_rnns_batched_loader(config):
 
 
 
-def sequential_mnist_factorized_rnn_conventional_nmf():
-    """Evaluate factorized RNN on the sequential MNIST task using conventional NMF W and H updates.
+def sequential_mnist_factorized_rnn_nmf_without_backprop():
+    """Evaluate factorized RNN on the sequential MNIST task using NMF updates without backpropagation.
 
     Evaluate the factorized RNN on the Sequential MNIST classification task.
 
@@ -2061,7 +2258,7 @@ def run_factorized_or_mlp_classifier(config):
         return network
 
 
-def train_and_evaluate_various_classifier():
+def run_classifier_pfc_mlp():
     """Train and evaluate positive factor networks using PFC blocks and MLP-based classification models.
 
     This reproduces all of the classification experiments involving the
@@ -2906,10 +3103,8 @@ def run_ood_mnist(config):
     # Reaches  0.9497 accuracy on MNIST test set with class_label_loss_strength = 0.5.
 
 
-
-
 @torch.no_grad()
-def train_and_evaluate_learning_repeated_sequence():
+def run_learning_repeated_sequence():
     """
     Train a non-negative factorized RNN using standard NMF updates on a deterministic sequence memorization task.
 
@@ -3055,31 +3250,36 @@ def cleanup_debug_plots_folder():
 
 if __name__ == "__main__":
     cleanup_debug_plots_folder()
-    # torch.set_num_threads(16)
     # torch.set_flush_denormal(True)
     torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
     torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
 
     # choose experiment to run:
-    run_experiment = 'run_sequential_mnist_rnn_experiments'
+    
+    #run_experiment = 'run_classifier_pfc_mlp'
+    run_experiment = 'run_learning_repeated_sequence'
+    #run_experiment = 'run_copy_task_factorized_rnn_no_backprop'
+    #run_experiment = 'run_copy_task_rnns_with_backprop'
+    #run_experiment = 'run_sequential_mnist_rnn_experiments'
+    #run_experiment = 'sequential_mnist_factorized_rnn_nmf_without_backprop'
 
-    if run_experiment == 'train_and_evaluate_various_classifier':
+    if run_experiment == 'run_classifier_pfc_mlp':
         # Run classifier experiments on MLP-like models. (Use for paper)
-        train_and_evaluate_various_classifier()
-    elif run_experiment == 'train_and_evaluate_learning_repeated_sequence':
+        run_classifier_pfc_mlp()
+    elif run_experiment == 'run_learning_repeated_sequence':
         # RNN using standard NMF updates on deterministic sequence memorization task.
-        train_and_evaluate_learning_repeated_sequence()
-    elif run_experiment == 'train_and_evaluate_copy_task_factorized_rnn':
-        # Factorized RNN using standard NMF updates on the copy task.
-        train_and_evaluate_copy_task_factorized_rnn()
-    elif run_experiment == 'train_and_evaluate_copy_task_vanilla_rnn':
+        run_learning_repeated_sequence()
+    elif run_experiment == 'run_copy_task_factorized_rnn_no_backprop':
+        # Factorized RNN using NMF learning updates on the copy task.
+        run_copy_task_factorized_rnn_no_backprop()
+    elif run_experiment == 'run_copy_task_rnns_with_backprop':
         # Conventional RNN with and without BPTT on the copy task.
-        train_and_evaluate_copy_task_vanilla_rnn()
+        run_copy_task_rnns_with_backprop()
     elif run_experiment == 'run_sequential_mnist_rnn_experiments':
-        # Run experiments on factorized and conventional RNNs on the Sequential MNIST task (uses backprop).
+        # Run experiments on factorized and conventional RNNs on the Sequential MNIST task with backprop.
         run_sequential_mnist_rnn_experiments()
-    elif run_experiment == 'sequential_mnist_factorized_rnn_conventional_nmf':
-        # Run experiment on factorized RNNs on the Sequential MNIST task using conventional NMF W and H updates (no backprop).
-        sequential_mnist_factorized_rnn_conventional_nmf()
+    elif run_experiment == 'sequential_mnist_factorized_rnn_nmf_without_backprop':
+        # Run experiment on factorized RNNs on the Sequential MNIST task using NMF updates without backprop.
+        sequential_mnist_factorized_rnn_nmf_without_backprop()
     else:
         raise ValueError("Bad experiment name.")

@@ -148,7 +148,6 @@ class VanillaRNN(nn.Module):
         self.h_prev_to_h = nn.Linear(hidden_dim, hidden_dim, bias=enable_bias)
         self.x_to_hidden_dim = nn.Linear(in_dim, hidden_dim, bias=False)
         self.h_to_y = nn.Linear(hidden_dim, out_dim, bias=enable_bias)
-        self.has_cell = False
         self.normalize_h_prev = enable_state_layernorm
         if self.normalize_h_prev:
             # Add layernorm before hidden state update
@@ -234,6 +233,9 @@ class BasicGRU(nn.Module):
 
     This implements a basic GRU for 1 time slice.
 
+    This is slightly more optimized than the basic GRU. It fuses some
+    matrix multiplications.
+
     Inputs:
         h_prev: The internal state vector from the previous time slice.
         x_t: The input feature vector for the current time slice.
@@ -257,15 +259,11 @@ class BasicGRU(nn.Module):
             self.ln = LayerNormNoParams(in_dim)
         else:
             self.ln = nn.LayerNorm((in_dim,))
-        self.h_to_f = nn.Linear(hidden_dim, hidden_dim, bias=enable_bias)
-        self.h_to_w = nn.Linear(hidden_dim, hidden_dim, bias=enable_bias)
-        self.x_to_f = nn.Linear(in_dim, hidden_dim, bias=enable_bias)
-        self.x_to_w = nn.Linear(in_dim, hidden_dim, bias=enable_bias)
+        z_dim = in_dim + hidden_dim
+        self.z_to_i = nn.Linear(z_dim, hidden_dim, bias=enable_bias)
+        self.z_to_r = nn.Linear(z_dim, hidden_dim, bias=enable_bias)
+        self.to_h_cand = nn.Linear(z_dim, hidden_dim, bias=enable_bias)
         self.h_to_y = nn.Linear(hidden_dim, out_dim, bias=enable_bias)
-        self.has_cell = False
-        self.x_to_c = nn.Linear(in_dim, hidden_dim, bias=enable_bias)
-        self.hidden_thingy_to_c = nn.Linear(hidden_dim, hidden_dim, bias=enable_bias)
-
         self.normalize_h_prev = enable_state_layernorm
         if self.normalize_h_prev:
             # Add layernorm before hidden state update
@@ -283,6 +281,10 @@ class BasicGRU(nn.Module):
         else:
             self.recurrent_dropout = None
 
+    @torch.no_grad()
+    def print_stats(self, do_plots=True, description=""):
+        pass
+
     def forward(self, x, h_prev):
         """
 
@@ -295,26 +297,25 @@ class BasicGRU(nn.Module):
             x = self.input_dropout(x)
         if self.enable_input_layernorm:
             x = self.ln(x)
-        x_f = self.x_to_f(x)
 
+        (batch_size, x_dim) = x.size()
+        (_, h_dim) = h_prev.size()
         if self.normalize_h_prev:
             h_prev = self.ln_h(h_prev)
-        h_f = self.h_to_f(h_prev)
-        f_t = F.sigmoid(h_f + x_f)
-
-        x_c = self.x_to_c(x)
-        x_w = self.x_to_w(x)
-        h_w = self.h_to_w(h_prev)
-        w_t = F.sigmoid(h_w + x_w)
-        hidden_thing = h_prev * w_t
-        hidden_thingy_c = self.hidden_thingy_to_c(hidden_thing)
-        c_t = F.tanh(hidden_thingy_c + x_c)
-
-        h = h_prev * f_t + (1 - f_t) * c_t
+        # Shape = (batch_size, z_dim)
+        z = torch.cat((h_prev, x), dim=1)
+        i = self.z_to_i(z)
+        i = torch.sigmoid(i)
+        r = self.z_to_r(z)
+        r = torch.sigmoid(r)
+        gated_h_prev = r * h_prev
+        q = torch.cat((gated_h_prev, x), dim=1)
+        h_cand = self.to_h_cand(q)
+        h_cand = torch.tanh(h_cand)
+        h = (1 - i) * h_prev + i * h_cand
         if self.recurrent_dropout is not None:
             h = self.recurrent_dropout(h) # reccurent dropout
         y = self.h_to_y(h)
-        #y = F.tanh(y)
         return y, h
 
 
@@ -449,8 +450,6 @@ class PFCBlock(nn.Module):
         self.lambda_2 = 0.0
         self.min_val = 1e-5
         self.instance_name = "PFC"
-        if config.nmf_inference_algorithm == "sgd":
-            self.inference_sgd_lr = nn.Parameter(torch.tensor(config.initial_inference_sgd_lr))
             
 
     @torch.no_grad()    
@@ -459,8 +458,6 @@ class PFCBlock(nn.Module):
 
         """
         logger = self.config.logger
-        if self.config.nmf_inference_algorithm == "sgd":
-            logger.debug(f"sgd learning rate: {self.inference_sgd_lr.item()}")
         logger.debug("Wx: min value: {}; max value: {}".format(self.Wx.min(), self.Wx.max()))
         logger.debug("Wy: min value: {}; max value: {}".format(self.Wy.min(), self.Wy.max()))
         if self.h_tran_copy is not None:
@@ -537,37 +534,18 @@ class PFCBlock(nn.Module):
         h_tran_shape = (batch_size, self.config.basis_vector_count)
         h_tran = torch.rand(h_tran_shape, device=x.device) * self.config.h_noise_scale    
         Wx = self.Wx
-        
-        if self.training and self.config.nmf_is_randomized_iters_no_grad:
-            random_integer = random.randint(0, self.config.nmf_inference_iters_no_grad)
-            nmf_inference_iters_no_grad = random_integer
-        else:
-            nmf_inference_iters_no_grad = self.config.nmf_inference_iters_no_grad
+        nmf_inference_iters_no_grad = self.config.nmf_inference_iters_no_grad
 
-        enable_normalization = self.config.enable_h_column_normalization
-        # Normalize "per NMF example"
-        # This is a very simple way to keep h from exploding: In X approx= W * H, each column x_i of X is
-        # an "example" and each corresponding column h_i of H is the inferred basis activations for the
-        # same (i'th) example. So, we just limit h_i such that its largest value is not allowed to be larger
-        # than the largest value in z_i.
-        with torch.no_grad():
-            if enable_normalization:
-                # Get column max values (i.e., per NMF example values = max value of each columns of "Z_temp")
-                max_allowed_example_vals = x.max(dim=0)[0]
-            else:
-                max_allowed_example_vals = None
         with torch.no_grad():
             h_tran = fista_right_update(x, Wx, tolerance=self.config.fista_tolerance, 
                                             max_iterations=nmf_inference_iters_no_grad, 
-                                            max_allowed_example_vals= max_allowed_example_vals,
+                                            apply_normalization_scaling=self.config.enable_h_column_normalization,
                                             debug=False)
         h_tran = fista_right_update(x, Wx, h_tran, tolerance=self.config.fista_tolerance, 
                                             max_iterations=self.config.nmf_gradient_iters_with_grad, 
-                                            max_allowed_example_vals= max_allowed_example_vals,
+                                            apply_normalization_scaling=self.config.enable_h_column_normalization,
                                             debug=False)
-
         self.h_tran = h_tran
-
         with torch.no_grad():
             # Save a copy for viewing stats
             self.h_tran_copy = h_tran.clone().detach()
@@ -767,30 +745,16 @@ class PFC2Layer(nn.Module):
         else:
             nmf_inference_iters_no_grad = self.config.nmf_inference_iters_no_grad
 
-        enable_normalization = self.config.enable_h_column_normalization  
-        
-        # Normalize "per NMF example".
-        # This is a very simple way to keep h from exploding: In X approx= W * H, each column x_i of X is
-        # an "example" and each corresponding column h_i of H is the inferred basis activations for the
-        # same (i'th) example. So, we just limit h_i such that its largest value is not allowed to be larger
-        # than the largest value in z_i.
-        with torch.no_grad():
-            if enable_normalization:
-                # Get column max values (i.e., per NMF example values = max value of each columns of "Z_temp")
-                max_allowed_example_vals = x.max(dim=0)[0]
-            else:
-                max_allowed_example_vals = None
         with torch.no_grad():
             tolerance = self.config.fista_tolerance
             h_tran = fista_right_update(x, Wx, tolerance=tolerance, 
                                             max_iterations=nmf_inference_iters_no_grad,
-                                            max_allowed_example_vals= max_allowed_example_vals,
+                                            apply_normalization_scaling=self.config.enable_h_column_normalization,
                                             debug=False)
         h_tran = fista_right_update(x, Wx, h_tran, tolerance=tolerance, 
                                             max_iterations=self.config.nmf_gradient_iters_with_grad,
-                                            max_allowed_example_vals= max_allowed_example_vals,
-                                            debug=False)
-        
+                                            apply_normalization_scaling=self.config.enable_h_column_normalization,
+                                            debug=False)        
         self.h_tran = h_tran
         with torch.no_grad():
             # Save a copy for viewing stats
@@ -809,28 +773,16 @@ class PFC2Layer(nn.Module):
         #y_pred = x * y_pred # also works
         y_pred = torch.clamp(x - y_pred, min=self.min_val) # note: relu() prevents negative values
         
-        # Normalize "per NMF example".
-        # This is a very simple way to keep h from exploding: In X approx= W * H, each column x_i of X is
-        # an "example" and each corresponding column h_i of H is the inferred basis activations for the
-        # same (i'th) example. So, we just limit h_i such that its largest value is not allowed to be larger
-        # than the largest value in z_i.
-        with torch.no_grad():
-            if enable_normalization:
-                # Get column max values (i.e., per NMF example values = max value of each columns of "Z_temp")
-                max_allowed_example_vals = y_pred.max(dim=0)[0]
-            else:
-                max_allowed_example_vals = None
         with torch.no_grad():
             tolerance = self.config.fista_tolerance
             h2_tran = fista_right_update(y_pred, Wx2, tolerance=tolerance, 
                                             max_iterations=nmf_inference_iters_no_grad,
-                                            max_allowed_example_vals= max_allowed_example_vals,
+                                            apply_normalization_scaling=self.config.enable_h_column_normalization,
                                             debug=False)
         h2_tran = fista_right_update(y_pred, Wx2, h2_tran, tolerance=tolerance, 
                                             max_iterations=self.config.nmf_gradient_iters_with_grad,
-                                            max_allowed_example_vals= max_allowed_example_vals,
+                                            apply_normalization_scaling=self.config.enable_h_column_normalization,
                                             debug=False)
-        
         self.h2_tran = h2_tran
         with torch.no_grad():
             # Save a copy for viewing stats
@@ -870,7 +822,8 @@ class PFC2Layer(nn.Module):
 class FactorizedRNN(nn.Module):
     """A factorized RNN.
 
-    This uses algorithm unrolling and operates on mini-batches.
+    This uses algorithm unrolling and is intended to be trained 
+    with the usual backpropagation.
 
     Note: This can be used in place of conventional RNNs such as
     `VanillaRNN` since the `forward()` method is compatible.
@@ -916,8 +869,6 @@ class FactorizedRNN(nn.Module):
         self.W_y = nn.Parameter(W_y)
         self.W_h = nn.Parameter(W_h)
         self.W_x = nn.Parameter(W_x)
-        self.max_x = 0
-        self.has_cell = False
 
     @torch.no_grad()
     def print_stats(self, do_plots=True, description=""):
@@ -940,7 +891,7 @@ class FactorizedRNN(nn.Module):
             self.W_x[self.W_x < min_val] = min_val
             
 
-    def forward(self, x, h_prev):
+    def forward(self, x, h_prev, return_reconstruction_loss = False):
         """
 
         Run the forward pass of the RNN on a batch of inputs for the current
@@ -954,13 +905,25 @@ class FactorizedRNN(nn.Module):
                 the input features for the current time step.
             h_prev (torch.tensor for float): Shape (batch_size, h_dim) tensor containing
                 the hidden state activations from the previous time step.
+            return_reconstruction_loss (boolean): If True, return the reconstruction loss for the input
+                h_prev and x.
 
         Returns:
+            If `return_reconstruction_loss` is False:
             (y, h): where y is a shape (batch_size, y_dim) tensor containing the
                 predicted output activations for the current time step and
-                h is a shape (batch_size, h_dim) tensor containng new hidden
+                h is a shape (batch_size, h_dim) tensor containing new hidden
                 state activations for the current time step. This h will then be
                 used as the `h_prev` input for the next time step.
+            If `return_reconstruction_loss` is True:
+            (y, h, loss_x, loss_h_prev): where y is a shape (batch_size, y_dim) tensor containing the
+                predicted output activations for the current time step and
+                h is a shape (batch_size, h_dim) tensor containing new hidden
+                state activations for the current time step. This h will then be
+                used as the `h_prev` input for the next time step.
+                `loss_x` is the reconstruction loss for the observed input `x`.
+                `loss_h_prev` is the reconstruction loss for the input previous state `h_prev`.
+
             
         """
         (batch_size, x_dim) = x.size()
@@ -974,35 +937,36 @@ class FactorizedRNN(nn.Module):
         # Factorization: Z approx= W_z * H 
         Z_temp = z.t()
         h = h_prev
-        
-        # Normalize "per NMF example"
-        # This is a very simple way to keep h from exploding: In Z approx= W * H, each column z_i of Z is
-        # an "example" and each corresponding column h_i of H is the inferred basis activations for the
-        # same (i'th) example. So, we just limit h_i such that its largest value is not allowed to be larger
-        # than the largest value in z_i.
-        with torch.no_grad():
-            # Get column max values (i.e., per NMF example values = max value of each columns of "Z_temp")
-            max_allowed_example_vals = Z_temp.max(dim=0)[0]
                 
         with torch.no_grad():
             h = fista_right_update(Z_temp, W_z, h, tolerance=self.config.fista_tolerance, 
                                                 max_iterations=self.config.nmf_inference_iters_no_grad,
                                                 shrinkage_sparsity=self.config.sparsity_L1_H,
-                                                max_allowed_example_vals= max_allowed_example_vals,
-                                                debug=False)
+                                                apply_normalization_scaling=True,
+                                                logger=self.config.logger)
 
         h = fista_right_update(Z_temp, W_z, h, tolerance=self.config.fista_tolerance, 
                                             max_iterations=self.config.nmf_gradient_iters_with_grad,
                                             shrinkage_sparsity=self.config.sparsity_L1_H,
-                                            max_allowed_example_vals= max_allowed_example_vals,
-                                            debug=False)
+                                            apply_normalization_scaling=True,
+                                            logger=self.config.logger)
         
         # Predictions based on inferred H:
         # shape: (batch_size, y_dim)
         y = torch.einsum("ij,kj->ki", self.W_y, h)
-        return y, h
 
+        if return_reconstruction_loss:
+            # Also return the input reconstruction loss for x and h_prev.
+            h_prev_pred = torch.einsum("ij,kj->ki", self.W_h, h)
+            h_prev_targets = h_prev.clone().detach()
+            loss_h_prev = torch.nn.functional.mse_loss(h_prev_pred, h_prev_targets, reduction='sum')/torch.numel(h_prev_targets)
 
+            x_pred = torch.einsum("ij,kj->ki", self.W_x, h)
+            x_targets = x.clone().detach()
+            loss_x = torch.nn.functional.mse_loss(x_pred, x_targets, reduction='sum')/torch.numel(x_targets)
+            return y, h, loss_x, loss_h_prev
+        else:
+            return y, h
 
 
 class FactorizedRNNWithoutBackprop:
@@ -1481,11 +1445,10 @@ class FactorizedRNNWithoutBackprop:
         return X
     
 
-
 class FactorizedRNNCopyTaskWithoutBackprop:
     """Factorized RNN for the Copy Task using NMF learning updates (no backpropagation).
 
-    This version uses NMF learning updates to update W. We
+    This version uses NMF learning updates to update the weights W. We
     iterate right (inference) updates until convergence and then perform a left 
     (learning) update. Backpropagation is not used.
 

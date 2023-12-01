@@ -38,7 +38,7 @@ conda install numba
 Main scripts:
 - `run_experiments.py`: Contains all experiments except source separation.
     - To choose an experiment to run, edit the value of the `run_experiment` variable near the bottom of the file.
-- `train_mss.py` Runs the source separation experiment (See below on additional setup and requirements before running)
+- `run_source_separation.py` Runs the source separation experiment (See below on additional setup and requirements before running)
 
 Folders:
 - `models/`: Contains the models used (PFC blocks, MLP, vanilla and factorized RNNs, etc.)
@@ -71,18 +71,18 @@ To view more verbose output while the script it running, in another terminal:
 tail -f debug.log
 ```
 
-* Image classification experiments involving MLP, 1-block PFC, and residual 2-block PFC models: `run_experiment = 'train_and_evaluate_various_classifier'`
-    - You can go into the function `train_and_evaluate_various_classifier()` and enable/disable individual experiments. E.g., set `run_mlp_image_classification_experiment = False` etc.
-* Factorized RNN using standard NMF updates on a deterministic sequence memorization task: `run_experiment = 'train_and_evaluate_learning_repeated_sequence'`
-* Factorized RNN using standard NMF learning and inference updates on the Copy Task: `run_experiment = 'train_and_evaluate_copy_task_factorized_rnn'`
-* Conventional vanilla RNN trained with and without BPTT on the copy task: `run_experiment = 'train_and_evaluate_copy_task_vanilla_rnn'`
-* Factorized and conventional vanilla RNNs on the Sequential MNIST task (uses backprop, with or without BPTT): `run_experiment = 'run_sequential_mnist_rnn_experiments'`
+* Image classification experiments involving MLP, 1-block PFC, and residual 2-block PFC models: `run_experiment = 'run_classifier_pfc_mlp'`
+    - You can go into the function `run_classifier_pfc_mlp()` and enable/disable individual experiments. E.g., set `run_mlp_image_classification_experiment = False` etc.
+* Factorized RNN using NMF updates only (i.e., without backpropagation) on a deterministic sequence memorization task: `run_experiment = 'run_learning_repeated_sequence'`
+* Factorized RNN using standard NMF updates only (i.e., without backpropagation) on the Copy Task: `run_experiment = 'run_copy_task_factorized_rnn_no_backprop'`
+* Vanilla and factorized RNN trained with backpropagation, and either with or without BPTT on the copy task: `run_experiment = 'run_copy_task_rnns_with_backprop'`
+* Factorized and conventional vanilla RNNs on the Sequential MNIST task with backpropagation, and either with or without BPTT: `run_experiment = 'run_sequential_mnist_rnn_experiments'`
 * Factorized RNNs on the Sequential MNIST task using only NMF learning and inference updates (no backprop): `run_experiment = 'sequential_mnist_factorized_rnn_conventional_nmf'`
 
 
 ### Source separation on  MUSDB18
 
-Since the source separation experiment requires some additional dependencies, it is separated into another script: `train_mss.py`. To run it, you will need to install the following extra dependencies and download the dataset.
+Since the source separation experiment requires some additional dependencies, it is separated into another script: `run_source_separation.py`. To run it, you will need to install the following extra dependencies and download the dataset.
 
 Install additional dependencies:
 
@@ -93,14 +93,14 @@ pip install fast-bss-eval
 
 Download the MUSDB18 dataset (high quality WAV version: musdb18hq).
 
-Locate `config_musdb18_rnn` in the file `train_mss.py` and edit the following fields:
+Locate `config_musdb18_rnn` in the file `run_source_separation.py` and edit the following fields:
 - Set `rnn_type` to either `vanillaRNN` to use the vanilla RNN or to `FactorizedRNN` to use the factorized RNN.
 - Set `musdb_root` to the root folder of the downloaded MUSDB dataset.
 
 To train and evaluate the model:
 
 ```
-python train_mss.py
+python run_source_separation.py
 ```
 
 The script will print the MSE on the test dataset at the end.

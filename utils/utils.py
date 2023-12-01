@@ -353,10 +353,9 @@ def fista_momentum(cur_H, prev_H, cur_m):
 def fista_right_update(X, W, H_tran_init=None, tolerance = 0.001, max_iterations=25, min_val = 1e-5, 
                            return_iter_count = False, shrinkage_sparsity = 0,
                            force_nonnegative=True,
-                           max_allowed_val = None,
-                           max_allowed_column_vals = None,
-                           max_allowed_example_vals = None,
-                           debug=False):
+                           apply_normalization_scaling = False,
+                           debug=False,
+                           logger=None):
     """Matrix factorization right update rule using FISTA.
     
     This runs several iterations of FISTA to compute the update for H in
@@ -385,20 +384,21 @@ def fista_right_update(X, W, H_tran_init=None, tolerance = 0.001, max_iterations
         min_val: Smallest allowable value in the returned H. Suggest 1e-5 or so.
         force_nonnegative: If True, perform NMF updates so that the returned H_tran will
             contain only non-negative values.
-        max_allowed_val (float or None): If not None, values in the inferred H_train will be
-            limited to at most this value. 
-        max_allowed_column_vals (tensor or None): If not None, it must be 1-dim with length equal to the number of
-            columns in H_tran, which will represent the maximum allowed values for each column.
-
+        apply_normalization_scaling (bool): If `True`, apply "Normalization for unrolled inference with backpropagation"
+            as discussed in the paper. The basic ideas is: Do not let the inferred values in a given column of `H`
+            from exceeding the maximum value of the corresponding column of `X`. 
+        
     Returns:
         H_tran (torch.tensor): The updated transpose of H.
 
     """
     with torch.no_grad():
         lr = fista_compute_lr_from_weights(W)
+        #lr = lr*0.5 # todo: is less then 1.0 better?
         #print(f"fista lr: {lr}")
     if debug:
-        print(f"lr from power method: {lr}")
+        #print(f"lr from power method: {lr}")
+        logger.debug(f"fista_right_update(): lr from power method: {lr}")
     (feature_dim, template_count) = W.size()
     (feature_dim_X, num_samples) = X.size()
     assert feature_dim == feature_dim_X
@@ -416,6 +416,16 @@ def fista_right_update(X, W, H_tran_init=None, tolerance = 0.001, max_iterations
         else:
             return next_H_tran
 
+    if apply_normalization_scaling:
+        # Normalize "per NMF example"
+        # This is a very simple way to keep h from exploding: In X approx= W * H, each column x_i of X is
+        # an "example" and each corresponding column h_i of H is the inferred basis activations for the
+        # same (i'th) example. So, we just limit h_i such that its largest value is not allowed to be larger
+        # than the largest value in x_i.
+        with torch.no_grad():
+            # Get max value in each column of X.
+            max_allowed_example_vals = X.max(dim=0)[0]
+
     for n in range(max_iterations):
         cur_H_tran = right_update_nmf_sgd(
                     X,
@@ -425,21 +435,8 @@ def fista_right_update(X, W, H_tran_init=None, tolerance = 0.001, max_iterations
                     shrinkage_sparsity=shrinkage_sparsity,
                     force_nonnegative_H=force_nonnegative,
                 )
-        
-        if max_allowed_val is not None:
-            maxh = cur_H_tran.max()
-            if maxh > max_allowed_val:
-                # Normalize hidden state to its value does not exceed maximum input value in X.
-                cur_H_tran = cur_H_tran * (max_allowed_val / maxh)
 
-        if max_allowed_column_vals is not None:
-            # Normalize the columns of H_tran to have max values that are no larger than the corresponding
-            # values in max_allowed_column_vals
-            maxh_columns = cur_H_tran.max(dim=0)[0]
-            scale = torch.where(maxh_columns > max_allowed_column_vals, max_allowed_column_vals / maxh_columns, torch.tensor(1., device=cur_H_tran.device))
-            cur_H_tran = cur_H_tran * scale.view(1, -1)
-
-        if max_allowed_example_vals is not None:
+        if apply_normalization_scaling:
             # Normalize the rows of H_tran (i.e., the columns of H) to have max values that are no larger than the corresponding
             # max values of the columns of the "X" matrix.
             with torch.no_grad():
@@ -453,25 +450,26 @@ def fista_right_update(X, W, H_tran_init=None, tolerance = 0.001, max_iterations
             tolerance_achieved = relative_norm_difference(prev_H_tran, cur_H_tran)
             if tolerance_achieved < tolerance:
                 if debug:
-                    print(f"FISTA converged in {n+1} iterations.")
+                    #print(f"FISTA converged in {n+1} iterations.")
+                    pass
                 break
 
-        if debug:
-            if n % 10 == 0:
-                # print RMSE
-                x_pred = W @ cur_H_tran.t()
-                rmse = compute_rmse(X, x_pred)
-                tolerance_achieved = relative_norm_difference(prev_H_tran, cur_H_tran)
-                print(f"FISTA iteration: {n} | RMSE: {rmse} | tolerance: {tolerance_achieved}")
+        #if debug:
+        #    if n % 10 == 0:
+        #        # print RMSE
+        #        x_pred = W @ cur_H_tran.t()
+        #        rmse = compute_rmse(X, x_pred)
+        #        tolerance_achieved = relative_norm_difference(prev_H_tran, cur_H_tran)
+        #        print(f"FISTA iteration: {n} | RMSE: {rmse} | tolerance: {tolerance_achieved}")
 
         prev_H_tran = cur_H_tran
 
     if max_iterations == 0:
         cur_H_tran = next_H_tran
 
-    if debug:
-        tolerance_achieved = relative_norm_difference(prev_H_tran, cur_H_tran)
-        print(f"tolerance achieved: {tolerance_achieved}")
+    #if debug:
+    #    tolerance_achieved = relative_norm_difference(prev_H_tran, cur_H_tran)
+    #    print(f"tolerance achieved: {tolerance_achieved}")
     if return_iter_count:
         return cur_H_tran, n+1
     else:
