@@ -733,8 +733,10 @@ def run_copy_task_factorized_rnn_no_backprop():
         print_train_loss_every_iterations = 200,
         compute_validation_loss_every_iterations = 200,
         rand_seq_len = 10,
-        pad_len = 5, # up to 10 works with perfect accuracy.
+        pad_len = 10, # up to 15 (at least) works with perfect accuracy. default: 5
         vocab_size = 10,
+        h_lr_scale = 0.5, # Reduced compared to paper for improved stability (was 0 in paper experiments)
+        w_lr_scale = 0.5, # Reduced compared to paper for improved stability (was 0 in paper experiments)
     )
 
     config = config_experiment1
@@ -816,6 +818,9 @@ def run_copy_task_factorized_rnn_no_backprop():
             config.logger.info(f"validation loss: {validation_loss} | best loss so far: {best_validation_loss} | mean per-slice accuracy: {validation_accuracy} | best so far: {best_validation_accuracy}")
             config.logger.info(f"numer: {val_acc_accumulator.get_total()} | denom: {val_acc_accumulator.get_count()}")
             network.print_stats(description="validation")
+            if validation_accuracy > 0.9999999:
+                config.logger.info("solved!")
+                break
 
 
 def run_sequential_mnist_rnn_experiments():
@@ -1517,7 +1522,7 @@ def sequential_mnist_factorized_rnn_nmf_without_backprop():
         basis_vector_count = 512,
         nmf_inference_algorithm = "fista",
         learning_algorithm = "sgd",
-        nmf_inference_iters_no_grad = 25,
+        nmf_inference_iters_no_grad = 100, # was 25 in paper experiments. changing for consistency.
         sparsity_L1_H = 0e-4,
         sparsity_L1_W = 0e-4,
         device="cuda",
@@ -1525,10 +1530,12 @@ def sequential_mnist_factorized_rnn_nmf_without_backprop():
         learning_rate=None,
         weight_decay_H=0e-5,
         weight_decay_W=0e-5,
-        weights_noise_scale = 1e-2,
+        weights_noise_scale = 2e-2, # was 1e-2 in paper experiments. changing for consistency.
         enforce_nonneg_params = True,
         print_train_loss_every_iterations = 20,
         compute_validation_loss_every_iterations = 200,
+        h_lr_scale = 0.5, # Reduced compared to paper for improved stability (was 0 in paper experiments)
+        w_lr_scale = 0.5, # Reduced compared to paper for improved stability (was 0 in paper experiments)
     )
     if config.dataset == "MNIST":
         # Load the MNIST dataset
@@ -3002,10 +3009,11 @@ def run_ood_mnist(config):
     # Reaches  0.9497 accuracy on MNIST test set with class_label_loss_strength = 0.5.
 
 
+
 @torch.no_grad()
-def run_learning_repeated_sequence():
+def run_repeated_sequence_no_backprop():
     """
-    Train a non-negative factorized RNN using standard NMF updates on a deterministic sequence memorization task.
+    Train a non-negative factorized RNN using NMF updates on a deterministic sequence memorization task.
 
     Uses SGD updates for both W and H factor matrices with auto FISTA lr.
 
@@ -3013,20 +3021,25 @@ def run_learning_repeated_sequence():
     required. So, the validation sequence is the same as the training sequence.
    
     """
-    # Use standard NMF left and right updates. Backprop is not used.
+    # Use NMF left and right updates. Backprop is not used.
     config_VanillaFactorizedRNN = AttributeDict(use_model = "VanillaFactorizedRNN",
-        basis_vector_count = 100,
+        basis_vector_count = 50, # 100
         # Number of iterations to allow the inference algorithm to hopefully converge
-        nmf_inference_iters = 100,
-        evaluation_nmf_inference_iteration_count = 100,
+        nmf_inference_iters = 100, # 100
+        evaluation_nmf_inference_iteration_count = 100, # 100
         weights_noise_scale = 2e-2,
         weight_decay_H = 0e-4,
         weight_decay_W = 0e-4,
-        sparsity_L1_H = 0e-4,
+        # Adding L1 regularization often leads to the optimal sparse solution. try 5e-4.
+        # Note that this was 0 in the paper experiments, but the new method seems more robust with
+        # faster convergence.
+        sparsity_L1_H = 5e-4, 
         enforce_nonneg_params = True,
+        h_lr_scale = 0.5, # Reduced compared to paper for improved stability (was 0 in paper experiments)
+        w_lr_scale = 0.5, # Reduced compared to paper for improved stability (was 0 in paper experiments)
     )
 
-    # Uses standard NMF updates for W and H.
+    # Uses NMF updates for W and H.
     config_standard_NMF_RNN = AttributeDict(
         device = "cpu",
         dataset = "sample_new_v1",
@@ -3036,7 +3049,7 @@ def run_learning_repeated_sequence():
         validation_seed_len=15,
         generate_token_count = 50,
         seed_seq_len = 175,
-        train_iterations = 500,
+        train_iterations = 410,
         use_optimizer="internal",
         learning_rate=None,
         weight_decay = 0,
@@ -3046,12 +3059,12 @@ def run_learning_repeated_sequence():
         run_evaluation_every = 100,
         sample_every = 100,
         model_config = config_VanillaFactorizedRNN,
-        results_dir = "figures/deterministic_nmf_rnn"
+        results_dir = "debug_plots"
     )
     config_VanillaFactorizedRNN.results_dir = config_standard_NMF_RNN.results_dir
     config_VanillaFactorizedRNN.device = config_standard_NMF_RNN.device
     config = config_standard_NMF_RNN
-    debugging = True
+    debugging = False
     if debugging:
         logger = configure_logger(log_results_file='experimental_results.log', log_debug_file='debug.log')
     else:
@@ -3091,16 +3104,16 @@ def run_learning_repeated_sequence():
         raise ValueError("Bad dataset name.")
 
     network = FactorizedRNNWithoutBackprop(config.model_config)
-            
-    h_next = None
+
     for iter in range(config.train_iterations):
         sys.stdout.write(".")
         sys.stdout.flush()
         
         x_train = x_train.to(config.device)
         y_train_targets = y_train_targets.to(config.device)
-        y_pred, h_next, loss = network.forward(x_train, y_train_targets, h_prev_init=h_next)
-        if iter % 20 == 0:
+        
+        y_pred, _, loss = network.forward(x_train, y_train_targets)
+        if iter % 10 == 0:
             config.logger.debug(f"iteration: {iter} | training loss: {loss.item()}")
         
         network.update_weights()
@@ -3135,6 +3148,8 @@ def run_learning_repeated_sequence():
             )
 
 
+
+
 def cleanup_debug_plots_folder():
     """Remove any plots (.png files) in the debug plots folder.
     """
@@ -3166,8 +3181,8 @@ if __name__ == "__main__":
         # Run classifier experiments on MLP-like models. (Use for paper)
         run_classifier_pfc_mlp()
     elif run_experiment == 'run_learning_repeated_sequence':
-        # RNN using standard NMF updates on deterministic sequence memorization task.
-        run_learning_repeated_sequence()
+        # Train and evaluate a factorized RNN using NMF updates on deterministic sequence memorization task.
+        run_repeated_sequence_no_backprop()
     elif run_experiment == 'run_copy_task_factorized_rnn_no_backprop':
         # Factorized RNN using NMF learning updates on the copy task.
         run_copy_task_factorized_rnn_no_backprop()

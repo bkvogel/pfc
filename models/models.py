@@ -1068,12 +1068,11 @@ class FactorizedRNNWithoutBackprop:
 
         We use SGD to implement the left-update step.
         """
-        
         W = torch.cat((self.W_y, self.W_h, self.W_x), dim=0)
         # Prepare X:
         H_tran = self.h_tran
         assert H_tran is not None, "You must call forward() before update_weights()"
-        w_lr = fista_compute_lr_from_weights(H_tran)
+        w_lr = fista_compute_lr_from_weights(H_tran)*self.config.w_lr_scale
         rows_W_y = self.config.y_dim
         rows_W_h = self.config.basis_vector_count
         row_start_W_h = rows_W_y + rows_W_h
@@ -1083,7 +1082,10 @@ class FactorizedRNNWithoutBackprop:
         V_targets[:rows_W_y,:] = self.y_targets[:, :]
         V_targets[rows_W_y:row_start_W_h, :] = self.h_prev_targets[:, :]
         V_targets[row_start_W_h:, :] = self.X_targets[:, :]
+
         
+        W = normalize_columns_at_most_equal_max_val(W, H_tran)
+
         W = left_update_nmf_sgd(V_targets, 
                                 W,
                                 H_tran,
@@ -1093,8 +1095,7 @@ class FactorizedRNNWithoutBackprop:
                                 min_val=self.min_val,
                                 force_nonnegative=True,
                                 )
-        if True:
-            (W, H_tran) = normalize_columns_equal_max_val(W, H_tran)
+
         self.W_y = W[:rows_W_y, :]
         self.W_h = W[rows_W_y:row_start_W_h, :]
         self.W_x = W[row_start_W_h:, :]
@@ -1125,8 +1126,9 @@ class FactorizedRNNWithoutBackprop:
             H_prev = torch.rand(self.config.basis_vector_count, seq_len-1, device=X.device)*self.inference_noise_scale
             H_prev = torch.cat((h_prev_init, H_prev), dim=1)
         else:
-            H_prev = torch.zeros(self.config.basis_vector_count, seq_len, device=X.device)
-        Z = torch.cat((H_prev, X), dim=0)
+            #H_prev = torch.zeros(self.config.basis_vector_count, seq_len, device=X.device)
+            H_prev = torch.rand(self.config.basis_vector_count, seq_len, device=X.device)*self.inference_noise_scale
+        
         h_tran = torch.rand(seq_len, self.config.basis_vector_count, device=X.device)*self.inference_noise_scale
 
         # inference weights
@@ -1135,7 +1137,7 @@ class FactorizedRNNWithoutBackprop:
         
         # Iterate to convergence on each time slice, then use the converged state output
         # as the input for the next time slice.
-        lr = fista_compute_lr_from_weights(W_z)
+        lr = fista_compute_lr_from_weights(W_z)*self.config.h_lr_scale
         self.inference_sgd_lr = lr
         y_pred_list = list()
         loss = 0
@@ -1148,25 +1150,23 @@ class FactorizedRNNWithoutBackprop:
             x_col_vec = X[:, t].unsqueeze(1)
             z_col_vec = torch.cat((h_prev_col_vec, x_col_vec), dim=0)
             h_tran_row_vec = h_tran[t, :].unsqueeze(0)
-            total_iters = self.config.nmf_inference_iters
-                    
-            for i in range(total_iters):
+              
+            for i in range(self.config.nmf_inference_iters):
                 h_tran_row_vec = right_update_nmf_sgd(
-                        z_col_vec,
-                        W_z,
-                        h_tran_row_vec,
-                        learn_rate=lr,
-                        shrinkage_sparsity=self.config.sparsity_L1_H,
-                        weight_decay=self.config.weight_decay_H,
-                        force_nonnegative_H=True,
-                )
-                    
-                if True:
-                    maxh = h_tran_row_vec.max()
-                    if maxh > max_allowed_value:
-                        # Normalize hidden state to its value does not exceed maximum input value in X.
-                        h_tran_row_vec = h_tran_row_vec * (max_allowed_value / maxh)
-                
+                            z_col_vec,
+                            W_z,
+                            h_tran_row_vec,
+                            learn_rate=lr,
+                            shrinkage_sparsity=self.config.sparsity_L1_H,
+                            weight_decay=self.config.weight_decay_H,
+                            force_nonnegative_H=True)
+                                
+                max_allowed_value = z_col_vec.max()
+                maxh = h_tran_row_vec.max()
+                if maxh > max_allowed_value:
+                    # Normalize hidden state to its value does not exceed maximum input value in X.
+                    h_tran_row_vec = h_tran_row_vec * (max_allowed_value / maxh)
+
             # Add the current inference result to h_tran:
             h_tran[t, :] = h_tran_row_vec.clone()[0, :]
             if t < seq_len - 1:
@@ -1566,7 +1566,7 @@ class FactorizedRNNCopyTaskWithoutBackprop:
         # So we need to reshape it into a 2-dim matrix to call the following function.
         H_tran_2D = rearrange(H_tran, 'b s h -> (b s) h')
         if self.config.learning_rate is None:
-            w_lr = fista_compute_lr_from_weights(H_tran_2D)
+            w_lr = fista_compute_lr_from_weights(H_tran_2D)*self.config.w_lr_scale
         else:
             w_lr = self.config.learning_rate
 
@@ -1600,6 +1600,8 @@ class FactorizedRNNCopyTaskWithoutBackprop:
         rows_W_y = self.config.y_dim
         rows_W_h = self.config.basis_vector_count
         row_start_W_h = rows_W_y + rows_W_h
+
+        W = normalize_columns_at_most_equal_max_val(W, H_tran_2D)
         W = left_update_nmf_sgd(V_2D, 
                                 W,
                                 H_tran_2D,
@@ -1610,7 +1612,7 @@ class FactorizedRNNCopyTaskWithoutBackprop:
                                 force_nonnegative=self.config.enforce_nonneg_params,
                                 M=M_V_2D,
                                 )
-        if True:
+        if False:
             # Apply scaling normalization to prevent W and/or H for exploding
             (W, H_tran_2D) = normalize_columns_equal_max_val(W, H_tran_2D)
         self.W_y = W[:rows_W_y, :]
@@ -1655,7 +1657,7 @@ class FactorizedRNNCopyTaskWithoutBackprop:
         if self.config.nmf_inference_algorithm == "sequential_sgd":
             # Iterate to convergence on each time slice, then use the converged state outptut
             # as the input for the next time slice.
-            lr = fista_compute_lr_from_weights(W_z)
+            lr = fista_compute_lr_from_weights(W_z)*self.config.h_lr_scale
             y_pred_list = list()
             loss = 0
             # let's set the maximum allowable value for hidden states to be equal to the largest value
@@ -1681,11 +1683,19 @@ class FactorizedRNNCopyTaskWithoutBackprop:
                         weight_decay = self.config.weight_decay_H,
                         force_nonnegative_H=True,
                     )
-                    if True:
+                    if False:
                         maxh = H_tran_temp.max()
                         if maxh > max_allowed_value:
                             # Normalize hidden state to its value does not exceed maximum input value in X.
                             H_tran_temp *= (max_allowed_value / maxh)
+
+                    max_allowed_value = Z_temp.max()
+                    maxh = H_tran_temp.max()
+                    if maxh > max_allowed_value:
+                        # Normalize hidden state to its value does not exceed maximum input value in X.
+                        H_tran_temp = H_tran_temp * (max_allowed_value / maxh)
+
+                    
                 
                 # Add the current inference result to h_tran:
                 h_tran[:, t, :] = H_tran_temp[:, :]
@@ -1821,10 +1831,8 @@ class FactorizedRNNWithoutBackpropSeqMNIST:
         self.W_y = self.W_y.to(device)
         self.W_h = self.W_h.to(device)
         self.W_x = self.W_x.to(device)
-
         self.h_tran = None
         self.inference_noise_scale = 0
-        
         self.h_lr = 0
         self.w_lr = 0
 
@@ -1932,7 +1940,7 @@ class FactorizedRNNWithoutBackpropSeqMNIST:
         # So we need to reshape it into a 2-dim matrix to call the following function.
         H_tran_2D = rearrange(H_tran, 'b s h -> (b s) h')
         if self.config.learning_rate is None:
-            w_lr = fista_compute_lr_from_weights(H_tran_2D)
+            w_lr = fista_compute_lr_from_weights(H_tran_2D)*self.config.w_lr_scale
         else:
             w_lr = self.config.learning_rate
 
@@ -1970,8 +1978,8 @@ class FactorizedRNNWithoutBackpropSeqMNIST:
         rows_W_h = self.config.basis_vector_count
         row_start_W_h = rows_W_y + rows_W_h
         
-        if self.config.learning_algorithm == "sgd":
-            W = left_update_nmf_sgd(V_2D, 
+        W = normalize_columns_at_most_equal_max_val(W, H_tran_2D)
+        W = left_update_nmf_sgd(V_2D, 
                                     W,
                                     H_tran_2D,
                                     learn_rate=w_lr,
@@ -1979,16 +1987,13 @@ class FactorizedRNNWithoutBackpropSeqMNIST:
                                     weight_decay=self.config.weight_decay_W,
                                     min_val=1e-5,
                                     force_nonnegative=self.config.enforce_nonneg_params,
-                                    M=M_V_2D,
-                                    scale_learn_rate_method=0,
-                                    )
-            if False:
-                (W, H_tran_2D) = normalize_columns_equal_max_val(W, H_tran_2D)
-            self.W_y = W[:rows_W_y, :]
-            self.W_h = W[rows_W_y:row_start_W_h, :]
-            self.W_x = W[row_start_W_h:, :]
-        else:
-            raise ValueError('oops')
+                                    M=M_V_2D)
+        #if False:
+        #    (W, H_tran_2D) = normalize_columns_equal_max_val(W, H_tran_2D)
+        self.W_y = W[:rows_W_y, :]
+        self.W_h = W[rows_W_y:row_start_W_h, :]
+        self.W_x = W[row_start_W_h:, :]
+        
 
     @torch.no_grad()
     def forward(self, x, targets = None):
@@ -2045,7 +2050,7 @@ class FactorizedRNNWithoutBackpropSeqMNIST:
         # Iterate to convergence on each time slice, then use the converged state outptut
         # as the input for the next time slice.
         if self.config.learning_rate_H is None:
-            lr = fista_compute_lr_from_weights(W_z)
+            lr = fista_compute_lr_from_weights(W_z)*self.config.h_lr_scale
         else:
             lr = self.config.learning_rate_H
 
@@ -2063,19 +2068,37 @@ class FactorizedRNNWithoutBackpropSeqMNIST:
             z_t_slice = torch.cat((h_prev_t_slice, x_t_slice), dim=1)
             Z_temp = z_t_slice.t()
             H_tran_temp = h_tran[:, t, :]
-            total_iters = self.config.nmf_inference_iters_no_grad
-            tolerance = self.config.fista_tolerance
-            H_tran_temp = fista_right_update(Z_temp, W_z, H_tran_temp, tolerance=tolerance, 
+            
+            if False:
+                total_iters = self.config.nmf_inference_iters_no_grad
+                tolerance = self.config.fista_tolerance
+                H_tran_temp = fista_right_update(Z_temp, W_z, H_tran_temp, tolerance=tolerance, 
                                             max_iterations=total_iters,
                                             shrinkage_sparsity=self.config.sparsity_L1_H,
                                             debug=False)
 
+                if True:
+                    # This is faster since to wait to normalize until after convergence of the current time slice of H.
+                    maxh = H_tran_temp.max()
+                    if maxh > max_allowed_value:
+                        # Normalize hidden state to its value does not exceed maximum input value in X.
+                        H_tran_temp *= (max_allowed_value / maxh)
             if True:
-                # This is faster since to wait to normalize until after convergence of the current time slice of H.
-                maxh = H_tran_temp.max()
-                if maxh > max_allowed_value:
-                    # Normalize hidden state to its value does not exceed maximum input value in X.
-                    H_tran_temp *= (max_allowed_value / maxh)
+                for i in range(self.config.nmf_inference_iters_no_grad):
+                    H_tran_temp = right_update_nmf_sgd(
+                            Z_temp,
+                            W_z,
+                            H_tran_temp,
+                            learn_rate=lr,
+                            shrinkage_sparsity=self.config.sparsity_L1_H,
+                            weight_decay=self.config.weight_decay_H,
+                            force_nonnegative_H=True)
+                                
+                    max_allowed_value = Z_temp.max()
+                    maxh = H_tran_temp.max()
+                    if maxh > max_allowed_value:
+                        # Normalize hidden state to its value does not exceed maximum input value in X.
+                        H_tran_temp = H_tran_temp * (max_allowed_value / maxh)
     
             # Add the current inference result to h_tran:
             h_tran[:, t, :] = H_tran_temp[:, :]

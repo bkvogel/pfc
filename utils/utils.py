@@ -355,6 +355,7 @@ def fista_right_update(X, W, H_tran_init=None, tolerance = 0.001, max_iterations
                            force_nonnegative=True,
                            apply_normalization_scaling = False,
                            debug=False,
+                           lr_scale=1.0,
                            logger=None):
     """Matrix factorization right update rule using FISTA.
     
@@ -394,7 +395,7 @@ def fista_right_update(X, W, H_tran_init=None, tolerance = 0.001, max_iterations
     """
     with torch.no_grad():
         lr = fista_compute_lr_from_weights(W)
-        #lr = lr*0.5 # todo: is less then 1.0 better?
+        lr = lr*lr_scale # todo: is less then 1.0 better?
         #print(f"fista lr: {lr}")
     if debug:
         #print(f"lr from power method: {lr}")
@@ -969,7 +970,7 @@ def normalize_columns_equal_max_val(x1, x2, clamp_max_val=None):
     max_x1 = x1_out.max(dim=0)[0]
     max_x2 = x2_out.max(dim=0)[0]
 
-    max_new = 0.5 * (max_x1 + max_x2)
+    max_new = 0.5 * (max_x1 + max_x2) 
     
     if clamp_max_val is not None:
         # optional, limit the largest allowable value.
